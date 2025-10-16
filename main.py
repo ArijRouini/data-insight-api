@@ -26,8 +26,9 @@ app = FastAPI(title="Data Insight API", version="3.1.9-FP1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        "https://arijrouini.github.io",
         "http://localhost:3000",
-        "http://127.0.0.1:3000",
+        "http://127.0.0.1:3000",       
     ],
     allow_credentials=True,
     allow_methods=["*"],
