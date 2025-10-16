@@ -1,0 +1,435 @@
+﻿from io import BytesIO
+import uuid
+from typing import Any, Optional, List, Dict, Tuple
+import os, re, json
+
+import numpy as np
+import pandas as pd
+from fastapi import FastAPI, File, UploadFile, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+# =========================
+#    LLM CONFIG
+# =========================
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+MAX_LLM_ITEMS = 24  # guardrail for huge datasets
+
+# =========================
+#    APP
+# =========================
+app = FastAPI(title="Data Insight API", version="3.1.0")
+
+# ---- CORS (dev-friendly) ----
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000","http://127.0.0.1:3000",
+        "http://localhost:3010","http://127.0.0.1:3010",
+        "http://localhost:3025","http://127.0.0.1:3025",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# -------- helpers --------
+def _to_py(v: Any):
+    if isinstance(v, (np.generic,)):
+        return v.item()
+    if isinstance(v, np.ndarray):
+        return v.tolist()
+    if isinstance(v, pd.Series):
+        return v.to_list()
+    if isinstance(v, pd.DataFrame):
+        return v.to_dict(orient="records")
+    return v
+
+def _deep_to_py(obj: Any):
+    if isinstance(obj, dict):
+        return {k: _deep_to_py(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_deep_to_py(v) for v in obj]
+    return _to_py(obj)
+
+def _read_table(raw: bytes, name: str) -> pd.DataFrame:
+    name = name.lower()
+    if name.endswith(".csv"):
+        return pd.read_csv(BytesIO(raw))
+    return pd.read_excel(BytesIO(raw))
+
+def _iqr_bounds(x: pd.Series) -> Tuple[float, float]:
+    q1 = x.quantile(0.25)
+    q3 = x.quantile(0.75)
+    iqr = q3 - q1
+    return q1 - 1.5 * iqr, q3 + 1.5 * iqr
+
+def _pct(n, d) -> float:
+    return 0.0 if d == 0 else round(100.0 * n / d, 2)
+
+def _strip_code_fences(s: str) -> str:
+    if not isinstance(s, str):
+        return s
+    s = re.sub(r"^```[\w-]*", "", s.strip())
+    s = re.sub(r"```$", "", s.strip())
+    return s.strip()
+
+# =========================
+#   OPENAI (primary)
+# =========================
+def llm_client():
+    from openai import OpenAI
+    # make the dependency on env explicit
+    return OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+def _first_json_block(text: str) -> Optional[dict | list]:
+    m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
+    blob = m.group(1) if m else text
+    try:
+        return json.loads(blob)
+    except Exception:
+        return None
+
+def llm_card(client, title: str, chart_type: str, context_stats: Dict[str, Any]) -> Dict[str, Any]:
+    """Return only {"summary": "..."} under each chart (no actions)."""
+    prompt = f"""
+You are a senior data analyst. Write one concise, business-focused paragraph UNDER a chart.
+
+Return ONLY JSON with exactly this key:
+- "summary": one paragraph (markdown allowed; use **bold** sparingly). No action items.
+
+Chart Title: {title}
+Chart Type: {chart_type}
+Stats/Context:
+{json.dumps(context_stats, ensure_ascii=False, indent=2)}
+
+Rules:
+- Objective tone, no first-person.
+- Focus on trends, risks, opportunities, or data-quality caveats.
+- Do not invent fields not present/implied.
+- Output valid JSON only, no extra text.
+"""
+    try:
+        resp = client.responses.create(model=OPENAI_MODEL, input=prompt)
+        txt = getattr(resp, "output_text", "") or ""
+        obj = _first_json_block(txt)
+        if not isinstance(obj, dict) or "summary" not in obj:
+            raise ValueError("LLM did not return a valid JSON object with 'summary'.")
+        obj["summary"] = _strip_code_fences(str(obj.get("summary", "")))
+        return obj
+    except Exception as e:
+        return {"summary": f"*(AI summary unavailable: {str(e)[:140]})*"}
+
+def llm_exec_summary(client, bullets_seed: List[str]) -> List[str]:
+    prompt = f"""
+From these analytic notes:
+{json.dumps(bullets_seed, ensure_ascii=False, indent=2)}
+
+Write 3–5 concise executive bullets (<= 20 words each) about business implications.
+Return ONLY a JSON array of strings. No commentary. No code fences.
+"""
+    try:
+        resp = client.responses.create(model=OPENAI_MODEL, input=prompt)
+        txt = getattr(resp, "output_text", "") or ""
+        data = _first_json_block(txt)
+        if isinstance(data, list) and data:
+            return [str(_strip_code_fences(x)) for x in data][:5]
+        lines = [l.strip(" -•") for l in _strip_code_fences(txt).splitlines() if l.strip()]
+        return lines[:5] if lines else bullets_seed[:5]
+    except Exception:
+        return bullets_seed[:5]
+
+def llm_closing_narrative(client, context: Dict[str, Any]) -> str:
+    prompt = f"""
+Craft a short spoken-style update (2–5 short paragraphs, ~120–220 words), no first-person.
+Start like: "Good morning, here’s a quick update on <topic>."
+Mention the latest period first, then trend context. Use simple language and crisp numbers.
+Return ONLY plain text (no JSON, no fences).
+
+Context:
+{json.dumps(context, ensure_ascii=False, indent=2)}
+"""
+    try:
+        resp = client.responses.create(model=OPENAI_MODEL, input=prompt)
+        return _strip_code_fences(getattr(resp, "output_text", "") or "").strip()
+    except Exception as e:
+        return f"(Narrative unavailable: {str(e)[:140]})"
+
+# -------- schema --------
+class ApiResponse(BaseModel):
+    ok: bool
+    insight: Optional[str] = None
+    executive_summary: Optional[Dict[str, Any]] = None  # {"bullets":[...]}
+    closing_summary: Optional[Dict[str, str]] = None     # {"narrative":"..."}
+    analysis_kit: Optional[dict] = None
+    charts: Optional[dict] = None
+    request_id: Optional[str] = None
+
+# -------- routes --------
+@app.get("/")
+def root(request: Request):
+    return {"ok": True, "message": "API running", "routes": ["/inspect_data", "/__whoami"]}
+
+@app.get("/__whoami")
+def whoami():
+    import os as _os
+    return {"ok": True, "version": app.version, "cwd": _os.getcwd(), "file": __file__}
+
+@app.post("/inspect_data", response_model=ApiResponse)
+async def inspect_data(file: UploadFile = File(...)):
+    client = llm_client()
+
+    rid = str(uuid.uuid4())
+    raw = await file.read()
+    df = _read_table(raw, file.filename)
+    dfx = df.copy()
+
+    n_rows, n_cols = len(dfx), len(dfx.columns)
+    num_cols = [c for c in dfx.columns if pd.api.types.is_numeric_dtype(dfx[c])]
+    cat_cols = [c for c in dfx.columns if not pd.api.types.is_numeric_dtype(dfx[c])]
+
+    charts: Dict[str, Any] = {}
+    seq = 0
+    def add_chart(fig):
+        nonlocal seq
+        cid = f"fig_{seq}"
+        charts[cid] = fig
+        seq += 1
+        return cid
+
+    # ----- KPIs -----
+    kpi_tasks = [{
+        "title": "Dataset Summary",
+        "explanation": f"{n_rows:,} rows × {n_cols} columns. Numeric: {len(num_cols)}, Categorical: {len(cat_cols)}.",
+        "ai": llm_card(client, "Dataset Summary", "kpi",
+                       {"rows": n_rows, "columns": n_cols, "numeric_cols": len(num_cols), "categorical_cols": len(cat_cols)})
+    }]
+
+    miss = dfx.isna().sum().sort_values(ascending=False).head(12)
+    if (miss > 0).any():
+        mid = add_chart({
+            "data": [{"type": "bar", "x": miss.index.tolist(), "y": miss.values.tolist()}],
+            "layout": {
+                "title": "Missing values by column",
+                "margin": {"l":30,"r":10,"t":40,"b":100},
+                "autosize": True,
+                "xaxis": {"title": "Column"},
+                "yaxis": {"title": "Missing count"}
+            }
+        })
+        miss_ctx = [{"column": c, "missing": int(v), "missing_pct": _pct(int(v), n_rows)} for c, v in miss.items() if v > 0]
+        kpi_tasks.append({
+            "title": "Data Quality · Missingness",
+            "chart_id": mid,
+            "ai": llm_card(client, "Data Quality · Missingness", "bar",
+                           {"top_missing_columns": miss_ctx, "total_rows": n_rows})
+        })
+
+    # ----- Explore -----
+    explore_tasks = []
+    llm_calls = len(kpi_tasks)
+
+    for col in num_cols[:6]:
+        vals = dfx[col].dropna().astype(float)
+        if not vals.empty:
+            counts, bins = np.histogram(vals, bins=20)
+            hid = add_chart({
+                "data": [{"type": "bar", "x": bins[:-1].tolist(), "y": counts.tolist(),
+                          "hovertemplate": "%{x}: %{y}<extra></extra>"}],
+                "layout": {
+                    "title": f"Distribution · {col}",
+                    "margin": {"l":30,"r":10,"t":40,"b":30},
+                    "autosize": True,
+                    "xaxis": {"title": col},
+                    "yaxis": {"title": "Count"}
+                }
+            })
+            if llm_calls < MAX_LLM_ITEMS:
+                stats = {
+                    "column": col,
+                    "non_null": int(vals.shape[0]),
+                    "mean": float(vals.mean()),
+                    "median": float(vals.median()),
+                    "std": float(vals.std(ddof=0)),
+                    "min": float(vals.min()),
+                    "max": float(vals.max())
+                }
+                explore_tasks.append({
+                    "title": f"Numeric · {col}",
+                    "chart_id": hid,
+                    "ai": llm_card(client, f"Distribution · {col}", "histogram", stats)
+                })
+                llm_calls += 1
+            else:
+                explore_tasks.append({"title": f"Numeric · {col}", "chart_id": hid,
+                                      "ai": {"summary": "*AI cap reached for this upload.*"}})
+
+    for col in cat_cols[:4]:
+        vc = dfx[col].astype(str).value_counts().head(15)
+        cid = add_chart({
+            "data": [{"type": "bar", "x": vc.index.tolist(), "y": vc.values.tolist()}],
+            "layout": {
+                "title": f"Top categories · {col}",
+                "margin": {"l":30,"r":10,"t":40,"b":120},
+                "autosize": True,
+                "xaxis": {"title": col},
+                "yaxis": {"title": "Count"}
+            }
+        })
+        if llm_calls < MAX_LLM_ITEMS:
+            top_cats = [{"category": str(k), "count": int(v)} for k, v in vc.items()]
+            explore_tasks.append({
+                "title": f"Categorical · {col}",
+                "chart_id": cid,
+                "ai": llm_card(client, f"Top categories · {col}", "bar", {"column": col, "top_categories": top_cats})
+            })
+            llm_calls += 1
+        else:
+            explore_tasks.append({"title": f"Categorical · {col}", "chart_id": cid,
+                                  "ai": {"summary": "*AI cap reached for this upload.*"}})
+
+    # ----- Relationships -----
+    rel_tasks = []
+    pairs = []
+    if len(num_cols) >= 2:
+        corr = dfx[num_cols].corr(numeric_only=True).fillna(0)
+        hid = add_chart({
+            "data": [{"type": "heatmap", "z": corr.values.tolist(), "x": corr.columns.tolist(), "y": corr.index.tolist()}],
+            "layout": {
+                "title": "Correlation heatmap",
+                "autosize": True,
+                "xaxis": {"title": "Features"},
+                "yaxis": {"title": "Features"}
+            }
+        })
+        cols = corr.columns.tolist()
+        for i in range(len(cols)):
+            for j in range(i+1, len(cols)):
+                r = float(corr.iloc[i, j])
+                pairs.append({"a": cols[i], "b": cols[j], "r": r})
+        pairs_sorted = sorted(pairs, key=lambda d: abs(d["r"]), reverse=True)[:8]
+        rel_tasks.append({
+            "title": "Correlation matrix",
+            "chart_id": hid,
+            "ai": llm_card(client, "Correlation heatmap", "heatmap", {"top_pairs": pairs_sorted})
+        })
+
+        x, y = num_cols[0], num_cols[1]
+        sid = add_chart({
+            "data": [{"type": "scattergl", "mode": "markers",
+                      "x": dfx[x].astype(float).where(dfx[x].notna(), None).tolist(),
+                      "y": dfx[y].astype(float).where(dfx[y].notna(), None).tolist()}],
+            "layout": {
+                "title": f"Scatter · {x} vs {y}",
+                "autosize": True,
+                "xaxis": {"title": x},
+                "yaxis": {"title": y}
+            }
+        })
+        m = dfx[[x, y]].astype(float).dropna()
+        r_xy = float(m[x].corr(m[y])) if not m.empty else None
+        rel_tasks.append({
+            "title": f"Scatter: {x} vs {y}",
+            "chart_id": sid,
+            "ai": llm_card(client, f"Scatter · {x} vs {y}", "scatter",
+                           {"x": x, "y": y, "n_points": int(len(m)), "pearson_r": r_xy})
+        })
+
+    # ----- Anomalies -----
+    ano_tasks = []
+    for col in num_cols[:3]:
+        s = dfx[col].dropna().astype(float)
+        if s.empty:
+            continue
+        lo, hi = _iqr_bounds(s)
+        out_n = int(((dfx[col] < lo) | (dfx[col] > hi)).sum())
+        y_min = float(np.nanmin(s)) if len(s) else 0.0
+        y_max = float(np.nanmax(s)) if len(s) else 1.0
+        ymin = float(min(lo, y_min))
+        ymax = float(max(hi, y_max))
+        pad = 0.05 * (ymax - ymin if ymax > ymin else 1.0)
+        bid = add_chart({
+            "data": [{"type": "box", "y": dfx[col].astype(float).where(dfx[col].notna(), None).tolist(),
+                      "boxpoints": "outliers", "name": col}],
+            "layout": {
+                "title": f"Boxplot · {col}",
+                "autosize": True,
+                "yaxis": {"title": col, "range": [ymin - pad, ymax + pad]},
+                "xaxis": {"title": ""}
+            }
+        })
+        ano_tasks.append({
+            "title": f"Outliers · {col}",
+            "chart_id": bid,
+            "explanation": f"{out_n} potential outliers (1.5×IQR).",
+            "ai": llm_card(client, f"Outliers · {col}", "boxplot",
+                           {"column": col, "potential_outliers": out_n, "lower_bound": lo, "upper_bound": hi})
+        })
+
+    categories = [
+        {"name": "KPIs", "tasks": kpi_tasks},
+        {"name": "Explore · Distributions & Categories", "tasks": explore_tasks},
+        {"name": "Relationships · Correlations & Scatter", "tasks": rel_tasks},
+        {"name": "Anomalies · Boxplots (IQR)", "tasks": ano_tasks},
+    ]
+
+    # ---------- Executive & Closing Summaries ----------
+    seed_notes = []
+    if (miss > 0).any():
+        top_miss_str = ", ".join([f"{c}({_pct(int(v), n_rows)}%)" for c, v in miss.items() if v > 0][:5])
+        seed_notes.append(f"Missingness risk in: {top_miss_str}.")
+    if len(num_cols) >= 2:
+        corr = dfx[num_cols].corr(numeric_only=True).fillna(0)
+        pairs_local = []
+        cols = corr.columns.tolist()
+        for i in range(len(cols)):
+            for j in range(i+1, len(cols)):
+                r = float(corr.iloc[i, j])
+                pairs_local.append({"a": cols[i], "b": cols[j], "r": r})
+        if pairs_local:
+            top = max(pairs_local, key=lambda d: abs(d["r"]))
+            seed_notes.append(f"Strongest linear link: {top['a']}↔{top['b']} (r={top['r']:.2f}).")
+
+    outlier_notes = []
+    for col in num_cols[:5]:
+        s = dfx[col].dropna().astype(float)
+        if s.empty:
+            continue
+        lo, hi = _iqr_bounds(s)
+        out_n = int(((dfx[col] < lo) | (dfx[col] > hi)).sum())
+        if out_n > 0:
+            outlier_notes.append(f"{col}({out_n})")
+    if outlier_notes:
+        seed_notes.append("Outliers present → " + ", ".join(outlier_notes))
+    if not seed_notes:
+        seed_notes.append("No critical data quality flags; proceed to deeper segmentation and driver analysis.")
+
+    exec_bullets = llm_exec_summary(client, seed_notes)
+    narrative_ctx = {"rows": n_rows, "columns": n_cols,
+                     "numeric_cols": num_cols[:10], "categorical_cols": cat_cols[:10],
+                     "notes": seed_notes[:8]}
+    narrative = llm_closing_narrative(client, narrative_ctx)
+
+    # -------- Stable Report figs --------
+    report_figs = {}
+    if num_cols:
+        c = num_cols[0]
+        counts, bins = np.histogram(dfx[c].dropna().astype(float), bins=20)
+        report_figs["first_hist"] = {
+            "data": [{"type": "bar", "x": bins[:-1].tolist(), "y": counts.tolist()}],
+            "layout": {"title": f"Histogram of {c}", "autosize": True,
+                       "xaxis": {"title": c}, "yaxis": {"title": "Count"}}
+        }
+    if "fig_0" in charts: report_figs["corr_heatmap"] = charts["fig_0"]
+    if "fig_1" in charts: report_figs["first_scatter"] = charts["fig_1"]
+
+    resp = {
+        "ok": True,
+        "insight": f"Rows: {n_rows:,}. Columns: {n_cols}.",
+        "executive_summary": {"bullets": exec_bullets},
+        "closing_summary": {"narrative": narrative},
+        "analysis_kit": {"categories": categories},
+        "charts": {**charts, **report_figs},
+        "request_id": rid,
+    }
+    return _deep_to_py(resp)
