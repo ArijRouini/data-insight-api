@@ -26,14 +26,14 @@ app = FastAPI(title="Data Insight API", version="3.1.9-FP1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://arijrouini.github.io",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",       
+        "https://arijrouini.github.io",   # your Pages site
     ],
-    allow_origin_regex=r"https://.*\.github\.io$",
+    allow_origin_regex=r"https://.*\.github\.io$",  # any *.github.io if you ever move
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],       # be explicit
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=3600,
 )
 
 # -------- helpers --------
