@@ -1,4 +1,4 @@
-﻿from io import BytesIO
+from io import BytesIO
 import uuid
 from typing import Any, Optional, List, Dict, Tuple
 import os
@@ -22,15 +22,15 @@ MAX_LLM_ITEMS = 24  # soft guardrail for huge datasets
 # =========================
 app = FastAPI(title="Data Insight API", version="3.1.9-FP1")
 
-# ---- CORS: allow dev servers  (localhost + 127.0.0.1) ----
+# ---- CORS: GitHub Pages + explicit methods/headers ----
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://arijrouini.github.io",   # your Pages site
+        "https://arijrouini.github.io",      # your Pages site
     ],
-    allow_origin_regex=r"https://.*\.github\.io$",  # any *.github.io if you ever move
+    allow_origin_regex=r"https://.*\.github\.io$",  # any *.github.io
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],       # be explicit
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["*"],
     max_age=3600,
@@ -77,14 +77,12 @@ def _strip_code_fences(s: str) -> str:
     s = re.sub(r"```$", "", s.strip())
     return s.strip()
 
-# =========================
-#   OPENAI (primary)
-# =========================
-def llm_client():
-    from openai import OpenAI
-    return OpenAI()
-
 def _first_json_block(text: str) -> Optional[dict | list]:
+    """
+    Try to extract a JSON blob. Accepts fenced or raw JSON.
+    """
+    if not isinstance(text, str):
+        return None
     m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
     blob = m.group(1) if m else text
     try:
@@ -93,12 +91,64 @@ def _first_json_block(text: str) -> Optional[dict | list]:
         return None
 
 # =========================
-#   SMARTER PROMPTS (only change)
+#   OPENAI client + compat
+# =========================
+def llm_client():
+    from openai import OpenAI
+    return OpenAI()  # relies on OPENAI_API_KEY env var
+
+def _call_openai_text(client, prompt: str) -> str:
+    """
+    Compatibility shim:
+      - New SDK path (>=1.0): client.responses.create(...)
+      - Legacy path: client.chat.completions.create(...)
+    Returns plain text.
+    """
+    # New SDK
+    if hasattr(client, "responses"):
+        try:
+            r = client.responses.create(model=OPENAI_MODEL, input=prompt)
+            # Preferred: output_text present in modern SDK
+            txt = getattr(r, "output_text", None)
+            if txt:
+                return txt
+            # Fallback: collect from blocks
+            try:
+                parts = []
+                out = getattr(r, "output", None)
+                if out and len(out) and hasattr(out[0], "content"):
+                    for block in out[0].content:
+                        if hasattr(block, "text"):
+                            parts.append(block.text or "")
+                        elif getattr(block, "type", "") == "output_text":
+                            parts.append(getattr(block, "text", "") or "")
+                return "".join(parts)
+            except Exception:
+                return ""
+        except Exception:
+            # fall through to legacy in case of runtime mismatch
+            pass
+
+    # Legacy chat.completions
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+    )
+    choice = resp.choices[0]
+    content = None
+    if hasattr(choice, "message"):
+        msg = choice.message
+        content = getattr(msg, "content", None) or (msg["content"] if isinstance(msg, dict) else None)
+    return content or ""
+
+# =========================
+#   PROMPTS (use compat shim)
 # =========================
 def llm_card(client, title: str, chart_type: str, context_stats: Dict[str, Any]) -> Dict[str, Any]:
     """
     Ask the LLM to produce a senior-analyst style card for a chart.
-    Output: { "summary": "..." }   (no actions list)
+    Output: { "summary": "..." }
     """
     prompt = f"""
 You are a senior data analyst. Produce a short, evidence-only interpretation UNDER a chart.
@@ -117,22 +167,18 @@ Chart Type: {chart_type}
 
 Context Statistics (may be partial; do not overclaim):
 {json.dumps(context_stats, ensure_ascii=False, indent=2)}
-"""
+""".strip()
     try:
-        resp = client.responses.create(model=OPENAI_MODEL, input=prompt)
-        txt = getattr(resp, "output_text", "") or ""
-        obj = _first_json_block(txt)
+        txt = _call_openai_text(client, prompt)
+        obj = _first_json_block(txt) or {}
         if not isinstance(obj, dict) or "summary" not in obj:
             raise ValueError("LLM did not return a valid JSON object with 'summary'.")
-        obj["summary"] = _strip_code_fences(str(obj.get("summary", "")))
+        obj["summary"] = _strip_code_fences(str(obj["summary"]))
         return obj
     except Exception as e:
         return {"summary": f"*(AI summary unavailable: {str(e)[:140]})*"}
 
 def llm_exec_summary(client, bullets_seed: List[str]) -> List[str]:
-    """
-    3–5 executive bullets (clean list of strings).
-    """
     prompt = f"""
 From these analytic notes:
 {json.dumps(bullets_seed, ensure_ascii=False, indent=2)}
@@ -143,23 +189,19 @@ Constraints:
 - Use numerals (e.g., 13.6%, 1.00, 5/1200) and state only verified implications.
 - No fluff, no advice, no first-person.
 Return ONLY a JSON array of strings. No commentary. No code fences.
-"""
+""".strip()
     try:
-        resp = client.responses.create(model=OPENAI_MODEL, input=prompt)
-        txt = getattr(resp, "output_text", "") or ""
+        txt = _call_openai_text(client, prompt)
         data = _first_json_block(txt)
         if isinstance(data, list) and data:
             return [str(_strip_code_fences(x)) for x in data][:5]
-        # Fallback: split lines
+        # Fallback: split lines if model forgot JSON
         lines = [l.strip(" -•") for l in _strip_code_fences(txt).splitlines() if l.strip()]
         return lines[:5] if lines else bullets_seed[:5]
     except Exception:
         return bullets_seed[:5]
 
 def llm_closing_narrative(client, context: Dict[str, Any]) -> str:
-    """
-    End-of-page narrative in the style the user requested (no first-person).
-    """
     prompt = f"""
 Role: Senior Data Analyst.
 
@@ -173,10 +215,9 @@ Write a precise, verification-friendly narrative (2–4 short paragraphs). Requi
 
 Context (columns, counts, notes):
 {json.dumps(context, ensure_ascii=False, indent=2)}
-"""
+""".strip()
     try:
-        resp = client.responses.create(model=OPENAI_MODEL, input=prompt)
-        return _strip_code_fences(getattr(resp, "output_text", "") or "").strip()
+        return _strip_code_fences(_call_openai_text(client, prompt)).strip()
     except Exception as e:
         return f"(Narrative unavailable: {str(e)[:140]})"
 
@@ -193,12 +234,21 @@ class ApiResponse(BaseModel):
 # -------- routes --------
 @app.get("/")
 def root(request: Request):
-    return {"ok": True, "message": "API running", "routes": ["/inspect_data", "/__whoami"]}
+    return {"ok": True, "message": "API running", "routes": ["/inspect_data", "/__whoami", "/__llm_ping"]}
 
 @app.get("/__whoami")
 def whoami():
     import os as _os
     return {"ok": True, "version": app.version, "cwd": _os.getcwd(), "file": __file__}
+
+@app.get("/__llm_ping")
+def llm_ping():
+    try:
+        c = llm_client()
+        path = "responses" if hasattr(c, "responses") else "chat.completions"
+        return {"ok": True, "sdk_path": path, "model": OPENAI_MODEL}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 @app.post("/inspect_data", response_model=ApiResponse)
 async def inspect_data(file: UploadFile = File(...)):
@@ -215,6 +265,7 @@ async def inspect_data(file: UploadFile = File(...)):
 
     charts: Dict[str, Any] = {}
     seq = 0
+
     def add_chart(fig):
         nonlocal seq
         cid = f"fig_{seq}"
@@ -227,7 +278,8 @@ async def inspect_data(file: UploadFile = File(...)):
         "title": "Dataset Summary",
         "explanation": f"{n_rows:,} rows × {n_cols} columns. Numeric: {len(num_cols)}, Categorical: {len(cat_cols)}.",
         "ai": llm_card(client, "Dataset Summary", "kpi",
-                       {"rows": n_rows, "columns": n_cols, "numeric_cols": len(num_cols), "categorical_cols": len(cat_cols)})
+                       {"rows": n_rows, "columns": n_cols,
+                        "numeric_cols": len(num_cols), "categorical_cols": len(cat_cols)})
     }]
 
     miss = dfx.isna().sum().sort_values(ascending=False).head(12)
@@ -236,7 +288,7 @@ async def inspect_data(file: UploadFile = File(...)):
             "data": [{"type": "bar", "x": miss.index.tolist(), "y": miss.values.tolist()}],
             "layout": {
                 "title": "Missing values by column",
-                "margin": {"l":30,"r":10,"t":40,"b":100},
+                "margin": {"l": 30, "r": 10, "t": 40, "b": 100},
                 "autosize": True,
                 "xaxis": {"title": "Column"},
                 "yaxis": {"title": "Missing count"}
@@ -263,7 +315,7 @@ async def inspect_data(file: UploadFile = File(...)):
                           "hovertemplate": "%{x}: %{y}<extra></extra>"}],
                 "layout": {
                     "title": f"Distribution · {col}",
-                    "margin": {"l":30,"r":10,"t":40,"b":30},
+                    "margin": {"l": 30, "r": 10, "t": 40, "b": 30},
                     "autosize": True,
                     "xaxis": {"title": col},
                     "yaxis": {"title": "Count"}
@@ -277,7 +329,7 @@ async def inspect_data(file: UploadFile = File(...)):
                     "median": float(vals.median()),
                     "std": float(vals.std(ddof=0)),
                     "min": float(vals.min()),
-                    "max": float(vals.max())
+                    "max": float(vals.max()),
                 }
                 explore_tasks.append({
                     "title": f"Numeric · {col}",
@@ -286,8 +338,11 @@ async def inspect_data(file: UploadFile = File(...)):
                 })
                 llm_calls += 1
             else:
-                explore_tasks.append({"title": f"Numeric · {col}", "chart_id": hid,
-                                      "ai": {"summary": "*AI cap reached for this upload.*"}})
+                explore_tasks.append({
+                    "title": f"Numeric · {col}",
+                    "chart_id": hid,
+                    "ai": {"summary": "*AI cap reached for this upload.*"}
+                })
 
     for col in cat_cols[:4]:
         vc = dfx[col].astype(str).value_counts().head(15)
@@ -295,7 +350,7 @@ async def inspect_data(file: UploadFile = File(...)):
             "data": [{"type": "bar", "x": vc.index.tolist(), "y": vc.values.tolist()}],
             "layout": {
                 "title": f"Top categories · {col}",
-                "margin": {"l":30,"r":10,"t":40,"b":120},
+                "margin": {"l": 30, "r": 10, "t": 40, "b": 120},
                 "autosize": True,
                 "xaxis": {"title": col},
                 "yaxis": {"title": "Count"}
@@ -306,12 +361,16 @@ async def inspect_data(file: UploadFile = File(...)):
             explore_tasks.append({
                 "title": f"Categorical · {col}",
                 "chart_id": cid,
-                "ai": llm_card(client, f"Top categories · {col}", "bar", {"column": col, "top_categories": top_cats})
+                "ai": llm_card(client, f"Top categories · {col}", "bar",
+                               {"column": col, "top_categories": top_cats})
             })
             llm_calls += 1
         else:
-            explore_tasks.append({"title": f"Categorical · {col}", "chart_id": cid,
-                                  "ai": {"summary": "*AI cap reached for this upload.*"}})
+            explore_tasks.append({
+                "title": f"Categorical · {col}",
+                "chart_id": cid,
+                "ai": {"summary": "*AI cap reached for this upload.*"}
+            })
 
     # ----- Relationships -----
     rel_tasks = []
@@ -319,7 +378,8 @@ async def inspect_data(file: UploadFile = File(...)):
     if len(num_cols) >= 2:
         corr = dfx[num_cols].corr(numeric_only=True).fillna(0)
         hid = add_chart({
-            "data": [{"type": "heatmap", "z": corr.values.tolist(), "x": corr.columns.tolist(), "y": corr.index.tolist()}],
+            "data": [{"type": "heatmap", "z": corr.values.tolist(),
+                      "x": corr.columns.tolist(), "y": corr.index.tolist()}],
             "layout": {
                 "title": "Correlation heatmap",
                 "autosize": True,
@@ -329,7 +389,7 @@ async def inspect_data(file: UploadFile = File(...)):
         })
         cols = corr.columns.tolist()
         for i in range(len(cols)):
-            for j in range(i+1, len(cols)):
+            for j in range(i + 1, len(cols)):
                 r = float(corr.iloc[i, j])
                 pairs.append({"a": cols[i], "b": cols[j], "r": r})
         pairs_sorted = sorted(pairs, key=lambda d: abs(d["r"]), reverse=True)[:8]
@@ -368,7 +428,6 @@ async def inspect_data(file: UploadFile = File(...)):
             continue
         lo, hi = _iqr_bounds(s)
         out_n = int(((dfx[col] < lo) | (dfx[col] > hi)).sum())
-        # axis range to show negative lower bound if any
         y_min = float(np.nanmin(s)) if len(s) else 0.0
         y_max = float(np.nanmax(s)) if len(s) else 1.0
         ymin = float(min(lo, y_min))
@@ -381,7 +440,7 @@ async def inspect_data(file: UploadFile = File(...)):
                 "title": f"Boxplot · {col}",
                 "autosize": True,
                 "yaxis": {"title": col, "range": [ymin - pad, ymax + pad]},
-                "xaxis": {"title": ""}  # single series
+                "xaxis": {"title": ""}
             }
         })
         ano_tasks.append({
@@ -443,8 +502,10 @@ async def inspect_data(file: UploadFile = File(...)):
             "layout": {"title": f"Histogram of {c}", "autosize": True,
                        "xaxis": {"title": c}, "yaxis": {"title": "Count"}}
         }
-    if "fig_0" in charts: report_figs["corr_heatmap"] = charts["fig_0"]
-    if "fig_1" in charts: report_figs["first_scatter"] = charts["fig_1"]
+    if "fig_0" in charts:
+        report_figs["corr_heatmap"] = charts["fig_0"]
+    if "fig_1" in charts:
+        report_figs["first_scatter"] = charts["fig_1"]
 
     resp = {
         "ok": True,
@@ -456,3 +517,4 @@ async def inspect_data(file: UploadFile = File(...)):
         "request_id": rid,
     }
     return _deep_to_py(resp)
+
